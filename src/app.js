@@ -22,6 +22,7 @@ const app = express();
 const medicalAgentRouter = require("./routes/medicalAgentRoutes");
 const reportGenRoutes = require("./routes/reportGen.routes");
 const dashboardRoutes = require("./routes/dashboardRoutes");
+const transcriptionRoutes = require("./routes/transcriptionRoutes");
 
 app.set("trust proxy", 1);
 
@@ -33,7 +34,10 @@ const limiter = rateLimit({
 
 app.use(helmet());
 app.use(cors());
-app.use(express.json());
+// الحد الافتراضي 100kb مش كفاية لطلبات فيها صورة base64 (زي شات الذكاء
+// الاصطناعي اللي بيقبل صور مباشرة في الـ JSON body، مش عن طريق multer
+// زي رفع ملفات الاستشارات) - رفعناه لـ 15mb يكفي صور طبية عادية
+app.use(express.json({ limit: "15mb" }));
 app.use(limiter);
 
 // بيسمح بعرض/تحميل ملفات التحاليل والأشعة المرفوعة من الفرونت (اللي غالبًا
@@ -71,6 +75,7 @@ app.get("/", (req, res) => {
 
 app.use("/api/reports", reportGenRoutes);
 app.use("/api/dashboard", dashboardRoutes);
+app.use("/api/transcribe", transcriptionRoutes);
 
 app.use(errorHandler);
 

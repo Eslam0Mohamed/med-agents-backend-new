@@ -9,8 +9,8 @@ module.exports = {
   // ✅ مفيش DEEPSEEK_API_KEY منفصل - موديل DeepSeek نفسه بيشتغل مجانًا عن
   // طريق NVIDIA_API_KEY تحت (build.nvidia.com بيستضيفه مجانًا)
   NVIDIA_API_KEY: process.env.NVIDIA_API_KEY,
-  // Groq - مستقل تمامًا، مش عن طريق NVIDIA. بنستخدم موديل بيقرا صور
-  // (qwen/qwen3.6-27b) مع كوتة يومية سخية جدًا مقارنة بـ Gemini
+  // Groq - مستخدم هنا بس لخدمة تحويل الصوت لنص (Whisper)، منفصل تمامًا
+  // عن نظام fallback التشخيص (اللي بيعتمد على Gemini + NVIDIA بس)
   GROQ_API_KEY: process.env.GROQ_API_KEY,
   PINECONE_API_KEY: process.env.PINECONE_API_KEY,
   GEMINI_API_KEY: process.env.GEMINI_API_KEY,
