@@ -10,17 +10,65 @@ const Followup = require('../models/Followup');
 const { chatCompletion } = require('../services/openai.service');
 
 
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 const register = async (req, res) => {
   try {
     const { name, email, password, specialty, language } = req.body;
 
-    const existing = await User.findOne({ email });
+    const trimmedName = (name || '').trim();
+    const trimmedEmail = (email || '').trim().toLowerCase();
+
+    if (!trimmedName || trimmedName.length < 2) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please enter your full name.',
+      });
+    }
+
+    if (!trimmedEmail || !EMAIL_REGEX.test(trimmedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please enter a valid email address.',
+      });
+    }
+
+    if (!password || password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 8 characters long.',
+      });
+    }
+
+    // نطلب رقم وحرف على الأقل - عشان منمنعش استخدام باسوردات زي "aaaaaaaa"
+    // اللي طولها كفاية بس ضعيفة فعليًا
+    if (!/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must contain at least one letter and one number.',
+      });
+    }
+
+    if (language && !['en', 'ar'].includes(language)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid language value.',
+      });
+    }
+
+    const existing = await User.findOne({ email: trimmedEmail });
     if (existing) {
       return res.status(400).json({ success: false, message: 'Email already exists' });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = await User.create({ name, email, passwordHash, specialty, language });
+    const user = await User.create({
+      name: trimmedName,
+      email: trimmedEmail,
+      passwordHash,
+      specialty: (specialty || '').trim() || undefined,
+      language,
+    });
 
     res.status(201).json({ success: true, data: { id: user._id, name: user.name, email: user.email } });
   } catch (error) {
