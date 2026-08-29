@@ -25,4 +25,14 @@ module.exports = {
   PAYMOB_PUBLIC_KEY: process.env.PAYMOB_PUBLIC_KEY,
   PAYMOB_INTEGRATION_ID: process.env.PAYMOB_INTEGRATION_ID,
   PAYMOB_HMAC_SECRET: process.env.PAYMOB_HMAC_SECRET,
+
+  // إعدادات إرسال الإيميلات (OTP التسجيل + نسيان الباسورد) - أي مزوّد
+  // SMTP عادي شغال (Gmail App Password, SendGrid, Mailgun, Resend...).
+  // مثال لو هتستخدم Gmail: SMTP_HOST=smtp.gmail.com, SMTP_PORT=587,
+  // SMTP_USER=your@gmail.com, SMTP_PASS=App Password (مش الباسورد العادي)
+  SMTP_HOST: process.env.SMTP_HOST,
+  SMTP_PORT: process.env.SMTP_PORT || 587,
+  SMTP_USER: process.env.SMTP_USER,
+  SMTP_PASS: process.env.SMTP_PASS,
+  SMTP_FROM: process.env.SMTP_FROM || "Med Agents <no-reply@medagents.com>",
 };

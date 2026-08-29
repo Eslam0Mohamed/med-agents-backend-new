@@ -13,6 +13,20 @@ const checkSubscription = async (req, res, next) => {
     });
   }
 
+  // خط دفاع فعلي في الباك اند - حتى لو حد تجاوز شاشة "تحت المراجعة" في
+  // الفرونت بأي طريقة (تعديل الكود، نداء الـ API مباشرة...)، السيرفر
+  // برضو بيرفض أي عملية طبية حقيقية لحد ما الأدمن يوافق على الحساب
+  if (user.verificationStatus !== "approved") {
+    return res.status(403).json({
+      error: "ACCOUNT_NOT_APPROVED",
+      verificationStatus: user.verificationStatus,
+      message:
+        user.verificationStatus === "rejected"
+          ? "Your account registration was rejected."
+          : "Your account is still under review by our team.",
+    });
+  }
+
   const subscription = user.subscription;
 
   // Trial
