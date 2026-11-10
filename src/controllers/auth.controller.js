@@ -1,5 +1,7 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const path = require('path');
+const fs = require('fs');
 const User = require('../models/User');
 const { JWT_SECRET, ADMIN_SECRET_KEY } = require('../config/env');
 const BlacklistedToken = require('../models/BlacklistedToken');
@@ -8,6 +10,13 @@ const Consultation = require('../models/Consultation');
 const Prescription = require('../models/Prescription');
 const Followup = require('../models/Followup');
 const { chatCompletion } = require('../services/openai.service');
+const {
+  generateOtp,
+  hashOtp,
+  sendOtpEmail,
+  OTP_TTL_MINUTES,
+} = require('../services/email.service');
+const { UPLOAD_DIR: CREDENTIAL_PROOF_DIR } = require('../middleware/credentialProofUpload.middleware');
 
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -56,21 +65,213 @@ const register = async (req, res) => {
       });
     }
 
+    // صورة/PDF إثبات إنه دكتور (كارت نقابة أو شهادة) - إلزامية، لأنها
+    // الأساس اللي الأدمن هيوافق أو يرفض الحساب بناءً عليها
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please upload proof that you are a licensed doctor (syndicate card or certificate).',
+      });
+    }
+
     const existing = await User.findOne({ email: trimmedEmail });
     if (existing) {
+      // امسح الملف اللي اترفع بالفعل قبل ما نرفض الطلب، عشان مانسيبش
+      // ملفات يتيمة على الديسك
+      fs.unlink(req.file.path, () => {});
       return res.status(400).json({ success: false, message: 'Email already exists' });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
+
+    const otp = generateOtp();
+    const emailOtpHash = hashOtp(otp);
+    const emailOtpExpiry = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
+
     const user = await User.create({
       name: trimmedName,
       email: trimmedEmail,
       passwordHash,
       specialty: (specialty || '').trim() || undefined,
       language,
+      credentialProofPath: req.file.filename,
+      verificationStatus: 'pending',
+      isEmailVerified: false,
+      emailOtpHash,
+      emailOtpExpiry,
     });
 
-    res.status(201).json({ success: true, data: { id: user._id, name: user.name, email: user.email } });
+    const emailResult = await sendOtpEmail(trimmedEmail, otp, { purpose: 'verify' });
+
+    res.status(201).json({
+      success: true,
+      data: { id: user._id, name: user.name, email: user.email },
+      // otpEmailSent بيبقى false لو SMTP مش متظبطة - الفرونت يقدر يوضح
+      // للدكتور إنه يتواصل مع الدعم لو الإيميل ما وصلوش
+      otpEmailSent: emailResult.sent,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// بعد التسجيل، الدكتور لازم يأكد إيميله بالكود اللي وصله قبل ما يقدر
+// يعمل login خالص
+const verifyEmailOtp = async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    const trimmedEmail = (email || '').trim().toLowerCase();
+
+    if (!trimmedEmail || !otp) {
+      return res.status(400).json({ success: false, message: 'Email and code are required.' });
+    }
+
+    const user = await User.findOne({ email: trimmedEmail });
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'Account not found.' });
+    }
+
+    if (user.isEmailVerified) {
+      return res.status(400).json({ success: false, message: 'Email is already verified.' });
+    }
+
+    if (!user.emailOtpHash || !user.emailOtpExpiry || user.emailOtpExpiry < new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Code expired. Please request a new one.',
+      });
+    }
+
+    if (hashOtp(otp) !== user.emailOtpHash) {
+      return res.status(400).json({ success: false, message: 'Invalid code.' });
+    }
+
+    user.isEmailVerified = true;
+    user.emailOtpHash = undefined;
+    user.emailOtpExpiry = undefined;
+    await user.save();
+
+    // بعد التأكيد، نديله توكن على طول (نفس شكل رد /login بالظبط) عشان
+    // الفرونت يقدر يكمله دخول مباشرة من غير ما يطلب منه يعمل login تاني
+    const token = jwt.sign(
+      { id: user._id, role: user.role, language: user.language },
+      JWT_SECRET,
+      { expiresIn: '7d' },
+    );
+
+    res.json({
+      success: true,
+      data: {
+        token,
+        name: user.name,
+        role: user.role,
+        language: user.language,
+        verificationStatus: user.verificationStatus,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+const resendEmailOtp = async (req, res) => {
+  try {
+    const { email } = req.body;
+    const trimmedEmail = (email || '').trim().toLowerCase();
+    const user = await User.findOne({ email: trimmedEmail });
+
+    // مبنقولش "الإيميل مش موجود" صراحة هنا - عشان محدش يقدر يستخدم
+    // الـ endpoint ده يتأكد إيه الإيميلات المسجلة في النظام (user enumeration)
+    if (!user || user.isEmailVerified) {
+      return res.json({
+        success: true,
+        message: 'If an account with this email exists and is unverified, a new code has been sent.',
+      });
+    }
+
+    const otp = generateOtp();
+    user.emailOtpHash = hashOtp(otp);
+    user.emailOtpExpiry = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
+    await user.save();
+
+    await sendOtpEmail(trimmedEmail, otp, { purpose: 'verify' });
+
+    res.json({
+      success: true,
+      message: 'If an account with this email exists and is unverified, a new code has been sent.',
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+const forgotPassword = async (req, res) => {
+  try {
+    const { email } = req.body;
+    const trimmedEmail = (email || '').trim().toLowerCase();
+    const user = await User.findOne({ email: trimmedEmail });
+
+    // نفس فكرة عدم الإفصاح فوق - رد موحّد سواء الإيميل موجود ولا لأ
+    if (!user) {
+      return res.json({
+        success: true,
+        message: 'If an account with this email exists, a reset code has been sent.',
+      });
+    }
+
+    const otp = generateOtp();
+    user.resetOtpHash = hashOtp(otp);
+    user.resetOtpExpiry = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
+    await user.save();
+
+    await sendOtpEmail(trimmedEmail, otp, { purpose: 'reset' });
+
+    res.json({
+      success: true,
+      message: 'If an account with this email exists, a reset code has been sent.',
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+const resetPasswordWithOtp = async (req, res) => {
+  try {
+    const { email, otp, newPassword } = req.body;
+    const trimmedEmail = (email || '').trim().toLowerCase();
+
+    if (!newPassword || newPassword.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 8 characters long.',
+      });
+    }
+    if (!/[a-zA-Z]/.test(newPassword) || !/[0-9]/.test(newPassword)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must contain at least one letter and one number.',
+      });
+    }
+
+    const user = await User.findOne({ email: trimmedEmail });
+    if (!user) {
+      return res.status(400).json({ success: false, message: 'Invalid or expired code.' });
+    }
+
+    if (!user.resetOtpHash || !user.resetOtpExpiry || user.resetOtpExpiry < new Date()) {
+      return res.status(400).json({ success: false, message: 'Code expired. Please request a new one.' });
+    }
+
+    if (hashOtp(otp) !== user.resetOtpHash) {
+      return res.status(400).json({ success: false, message: 'Invalid code.' });
+    }
+
+    user.passwordHash = await bcrypt.hash(newPassword, 10);
+    user.resetOtpHash = undefined;
+    user.resetOtpExpiry = undefined;
+    await user.save();
+
+    res.json({ success: true, message: 'Password updated successfully. You can now log in.' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -95,13 +296,38 @@ const login = async (req, res) => {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
+    // لازم يأكد إيميله الأول قبل أي حاجة تانية - من غير كده مش هنديله
+    // توكن خالص، لأن هويته لسه مش متأكدة
+    if (!user.isEmailVerified) {
+      return res.status(403).json({
+        success: false,
+        error: 'EMAIL_NOT_VERIFIED',
+        message: 'Please verify your email before logging in.',
+        data: { email: user.email },
+      });
+    }
+
     const token = jwt.sign(
       { id: user._id, role: user.role, language: user.language },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
 
-    res.json({ success: true, data: { token, name: user.name, role: user.role, language: user.language } });
+    // بنسيب الدكتور يدخل حتى لو حسابه لسه pending أو rejected (بدل ما
+    // نمنعه خالص)، والفرونت هو اللي بيقرر يوريه شاشة "تحت المراجعة" أو
+    // "الحساب مرفوض" بناءً على verificationStatus - أي محاولة فعلية
+    // للوصول لبيانات طبية حقيقية برضو محمية من الباك اند (requireApprovedDoctor)
+    res.json({
+      success: true,
+      data: {
+        token,
+        name: user.name,
+        role: user.role,
+        language: user.language,
+        verificationStatus: user.verificationStatus,
+        rejectionReason: user.rejectionReason,
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -125,6 +351,81 @@ const getAllDoctors = async (req, res) => {
   try {
     const doctors = await User.find({ role: 'doctor' }).select('-passwordHash');
     res.json({ success: true, count: doctors.length, data: doctors });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ===== موافقة الأدمن على تسجيل الأطباء =====
+
+const getPendingDoctors = async (req, res) => {
+  try {
+    const doctors = await User.find({
+      role: 'doctor',
+      verificationStatus: 'pending',
+    })
+      .select('-passwordHash')
+      .sort({ createdAt: 1 });
+    res.json({ success: true, count: doctors.length, data: doctors });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// بيرجع ملف إثبات الهوية للأدمن بس - endpoint محمي، مش static route عام
+// زي lab-files (المشكلة اللي كانت عندنا قبل كده)
+const getDoctorCredentialProof = async (req, res) => {
+  try {
+    const doctor = await User.findById(req.params.id).select('credentialProofPath');
+    if (!doctor || !doctor.credentialProofPath) {
+      return res.status(404).json({ success: false, message: 'File not found' });
+    }
+
+    const filePath = path.join(CREDENTIAL_PROOF_DIR, doctor.credentialProofPath);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ success: false, message: 'File not found on server' });
+    }
+
+    res.sendFile(filePath);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+const approveDoctor = async (req, res) => {
+  try {
+    const doctor = await User.findById(req.params.id);
+    if (!doctor || doctor.role !== 'doctor') {
+      return res.status(404).json({ success: false, message: 'Doctor not found' });
+    }
+
+    doctor.verificationStatus = 'approved';
+    doctor.rejectionReason = undefined;
+    doctor.reviewedAt = new Date();
+    doctor.reviewedBy = req.user.id;
+    await doctor.save();
+
+    res.json({ success: true, message: 'Doctor approved successfully', data: doctor });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+const rejectDoctor = async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const doctor = await User.findById(req.params.id);
+    if (!doctor || doctor.role !== 'doctor') {
+      return res.status(404).json({ success: false, message: 'Doctor not found' });
+    }
+
+    doctor.verificationStatus = 'rejected';
+    doctor.rejectionReason = (reason || '').trim() || 'Submitted credentials could not be verified.';
+    doctor.reviewedAt = new Date();
+    doctor.reviewedBy = req.user.id;
+    await doctor.save();
+
+    res.json({ success: true, message: 'Doctor registration rejected', data: doctor });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -222,7 +523,16 @@ const createAdmin = async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = await User.create({ name, email, passwordHash, role: 'admin' });
+    // الأدمن بيتجاوز كل خطوات التحقق (تأكيد إيميل + موافقة أدمن) لأنه
+    // أصلاً بيتعمل بمفتاح سري من شخص موثوق فيه، مش عن طريق /register العام
+    const user = await User.create({
+      name,
+      email,
+      passwordHash,
+      role: 'admin',
+      isEmailVerified: true,
+      verificationStatus: 'approved',
+    });
 
     res.status(201).json({ success: true, data: { id: user._id, name: user.name, role: user.role } });
   } catch (error) {
@@ -281,4 +591,23 @@ const updateMyProfile = async (req, res) => {
   }
 };
 
-module.exports = { register, login, logout, testAI, getAllDoctors, getDoctorById, updateDoctor, deleteDoctor, createAdmin, updateMyProfile };
+module.exports = {
+  register,
+  verifyEmailOtp,
+  resendEmailOtp,
+  forgotPassword,
+  resetPasswordWithOtp,
+  login,
+  logout,
+  testAI,
+  getAllDoctors,
+  getDoctorById,
+  updateDoctor,
+  deleteDoctor,
+  createAdmin,
+  updateMyProfile,
+  getPendingDoctors,
+  getDoctorCredentialProof,
+  approveDoctor,
+  rejectDoctor,
+};
