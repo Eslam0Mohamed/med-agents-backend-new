@@ -75,7 +75,12 @@ const register = async (req, res) => {
     }
 
     const existing = await User.findOne({ email: trimmedEmail });
-    if (existing) {
+
+    // بنرفض الإيميل المكرر، ماعدا الدكتور اللي اترفض - ده بنسيبه يقدم تاني
+    const canResubmit =
+      existing && existing.role === 'doctor' && existing.verificationStatus === 'rejected';
+
+    if (existing && !canResubmit) {
       // امسح الملف اللي اترفع بالفعل قبل ما نرفض الطلب، عشان مانسيبش
       // ملفات يتيمة على الديسك
       fs.unlink(req.file.path, () => {});
@@ -88,18 +93,45 @@ const register = async (req, res) => {
     const emailOtpHash = hashOtp(otp);
     const emailOtpExpiry = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
 
-    const user = await User.create({
-      name: trimmedName,
-      email: trimmedEmail,
-      passwordHash,
-      specialty: (specialty || '').trim() || undefined,
-      language,
-      credentialProofPath: req.file.filename,
-      verificationStatus: 'pending',
-      isEmailVerified: false,
-      emailOtpHash,
-      emailOtpExpiry,
-    });
+    let user;
+    if (canResubmit) {
+      // امسح الكارنيه القديم عشان مانسيبش ملفات يتيمة
+      if (existing.credentialProofPath) {
+        fs.unlink(path.join(CREDENTIAL_PROOF_DIR, existing.credentialProofPath), () => {});
+      }
+
+      existing.name = trimmedName;
+      existing.passwordHash = passwordHash;
+      existing.specialty = (specialty || '').trim() || undefined;
+      if (language) existing.language = language;
+      existing.credentialProofPath = req.file.filename;
+
+      // رجّعه للمراجعة من الأول
+      existing.verificationStatus = 'pending';
+      existing.rejectionReason = undefined;
+      existing.reviewedAt = undefined;
+      existing.reviewedBy = undefined;
+
+      // لازم يأكد الإيميل تاني، عشان محدش يقدر يستولي على إيميل غيره
+      existing.isEmailVerified = false;
+      existing.emailOtpHash = emailOtpHash;
+      existing.emailOtpExpiry = emailOtpExpiry;
+
+      user = await existing.save();
+    } else {
+      user = await User.create({
+        name: trimmedName,
+        email: trimmedEmail,
+        passwordHash,
+        specialty: (specialty || '').trim() || undefined,
+        language,
+        credentialProofPath: req.file.filename,
+        verificationStatus: 'pending',
+        isEmailVerified: false,
+        emailOtpHash,
+        emailOtpExpiry,
+      });
+    }
 
     const emailResult = await sendOtpEmail(trimmedEmail, otp, { purpose: 'verify' });
 
